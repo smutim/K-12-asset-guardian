@@ -1,81 +1,86 @@
+from __future__ import annotations
+
+import json
 import os
 import socket
-import json
-import requests
-from datetime import datetime
-from dotenv import load_dotenv
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
-from sonicwall_parser import parse_sonicwall_syslog
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-
-load_dotenv()
-
-# -------------------------
-# Configuration (env vars)
-# -------------------------
-SYSLOG_HOST = os.getenv("SYSLOG_HOST", "0.0.0.0")
-SYSLOG_PORT = int(os.getenv("SYSLOG_PORT", "1514"))  # non-privileged UDP port
-
-API_BASE = os.getenv("API_BASE", "http://backend:8000")
-INGEST_ENDPOINT = f"{API_BASE}/ingest/webfilter"
-
-SCHOOL_ID = int(os.getenv("SCHOOL_ID", "1"))
-SCHOOL_API_KEY = os.getenv("SCHOOL_API_KEY", "")
-SOURCE_NAME = os.getenv("SOURCE_NAME", "sonicwall")
-
-SOCKET_BUFFER = 8192
+from sonicwall_parser import parse_sonicwall_line
 
 
-def send_to_backend(payload: dict) -> None:
+app = FastAPI(title="Syslog Ingest", version="0.1.0")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_json(obj: Any) -> Any:
+    """
+    Ensure payload is JSON-serializable.
+    """
     try:
-        r = requests.post(INGEST_ENDPOINT, json=payload, timeout=10)
-        if r.status_code >= 300:
-            print(
-                "[syslog_ingest] Backend rejected event:",
-                r.status_code,
-                r.text[:300],
-            )
-    except Exception as exc:
-        print("[syslog_ingest] Failed to send event:", exc)
+        json.dumps(obj)
+        return obj
+    except Exception:
+        return {"_non_serializable": str(obj)}
 
 
-def run_udp_server():
-    if not SCHOOL_API_KEY:
-        raise RuntimeError("Missing SCHOOL_API_KEY environment variable")
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok", "ts": _utc_now_iso()}
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((SYSLOG_HOST, SYSLOG_PORT))
 
-    print(
-        f"[syslog_ingest] Listening on UDP {SYSLOG_HOST}:{SYSLOG_PORT} "
-        f"→ {INGEST_ENDPOINT}"
-    )
+@app.post("/ingest/sonicwall")
+async def ingest_sonicwall(request: Request) -> JSONResponse:
+    """
+    Accept syslog content via HTTP POST.
+    Body can be:
+      - raw text (one or many lines)
+      - JSON: {"message": "..."} or {"messages": ["...", "..."]}
+    Returns normalized events.
+    """
+    content_type = request.headers.get("content-type", "")
 
-    while True:
-        data, addr = sock.recvfrom(SOCKET_BUFFER)
-        line = data.decode("utf-8", errors="ignore")
+    raw_lines: list[str] = []
+    if "application/json" in content_type:
+        body = await request.json()
+        if isinstance(body, dict):
+            if "messages" in body and isinstance(body["messages"], list):
+                raw_lines = [str(x) for x in body["messages"]]
+            elif "message" in body:
+                raw_lines = [str(body["message"])]
+            else:
+                # If someone posts an arbitrary object, store it as a single line JSON
+                raw_lines = [json.dumps(body)]
+        elif isinstance(body, list):
+            raw_lines = [json.dumps(x) if not isinstance(x, str) else x for x in body]
+        else:
+            raw_lines = [str(body)]
+    else:
+        # Treat as plain text
+        text = (await request.body()).decode("utf-8", errors="replace")
+        raw_lines = [ln for ln in text.splitlines() if ln.strip()]
 
-        parsed = parse_sonicwall_syslog(line)
-        if not parsed:
-            continue
+    host = socket.gethostname()
+    customer_id = request.headers.get("x-customer-id") or os.getenv("CUSTOMER_ID")
 
-        payload = {
-            "api_key": SCHOOL_API_KEY,
-            "school_id": SCHOOL_ID,
-            "source": SOURCE_NAME,
-            "device": {
-                # SonicWall often only knows the source IP
-                "asset_tag": "",
-                "serial_number": "",
-                "hostname": "",
-                "ip": parsed.get("ip") or "",
-            },
-            "user": {
-                "email":
-from fastapi import FastAPI
+    events: list[Dict[str, Any]] = []
+    for line in raw_lines:
+        parsed = parse_sonicwall_line(line)
+        event: Dict[str, Any] = {
+            "source": "sonicwall",
+            "received_at": _utc_now_iso(),
+            "customer_id": customer_id,
+            "ingest_host": host,
+            "raw": line,
+            "parsed": _safe_json(parsed),
+        }
+        events.append(event)
 
-app = FastAPI()
+    return JSONResponse({"count": len(events), "events": events})
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "k-12-asset-guardian"}

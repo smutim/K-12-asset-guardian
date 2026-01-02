@@ -1,89 +1,63 @@
+from __future__ import annotations
+
 import re
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 
-# Regex patterns to extract common SonicWall web filter fields.
-# SonicWall syslog formats vary by firmware; this parser is intentionally resilient.
-DOMAIN_RE = re.compile(
-    r"(?:dstname=|domain=|Host:)\s*(?P<domain>[A-Za-z0-9\.\-]+\.[A-Za-z]{2,})",
-    re.IGNORECASE,
-)
-URL_RE = re.compile(
-    r"(?:url=|URI=|Requested URL:)\s*(?P<url>https?://\S+)",
-    re.IGNORECASE,
-)
-SRCIP_RE = re.compile(
-    r"(?:src=|srcip=|Source IP:)\s*(?P<ip>\d{1,3}(?:\.\d{1,3}){3})",
-    re.IGNORECASE,
-)
-USER_RE = re.compile(
-    r"(?:user=|usr=|User:)\s*(?P<user>[A-Za-z0-9\.\-_@]+)",
-    re.IGNORECASE,
-)
-ACTION_RE = re.compile(
-    r"(?:action=|Result:|msg=)\s*(?P<action>allowed|blocked|deny|denied|drop|dropped)",
-    re.IGNORECASE,
-)
-CATEGORY_RE = re.compile(
-    r"(?:cat=|category=|Category:)\s*(?P<category>[A-Za-z0-9 _\-/]+)",
-    re.IGNORECASE,
+_SYSLOG_TS = re.compile(
+    r"^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<rest>.*)$"
 )
 
+# Very lightweight key=value extractor for SonicWall-like logs
+_KV = re.compile(r'(?P<k>[A-Za-z0-9_\-\.]+)=(?P<v>"[^"]*"|\S+)')
 
-def parse_sonicwall_syslog(line: str) -> Optional[dict]:
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _strip_quotes(v: str) -> str:
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
+def parse_sonicwall_line(line: str) -> Dict[str, Any]:
     """
-    Attempts to parse a SonicWall syslog line related to web filtering.
-
-    Returns a normalized dict or None if the line is not relevant.
-
-    Output example:
-    {
-      "type": "web_access",
-      "url": "https://example.com",
-      "domain": "example.com",
-      "action": "blocked",
-      "category": "Adult",
-      "ip": "10.0.0.5",
-      "user": "student@district.org",
-      "raw": "<original syslog line>"
-    }
+    Best-effort SonicWall syslog line parser.
+    Returns a dictionary that is always safe to JSON serialize.
     """
+    line = (line or "").strip()
     if not line:
-        return None
+        return {"ok": False, "error": "empty_line"}
 
-    raw = line.strip()
-    lower = raw.lower()
+    out: Dict[str, Any] = {
+        "ok": True,
+        "parsed_at": _utc_now_iso(),
+    }
 
-    # Fast filter: ignore non-web related logs
-    if not any(k in lower for k in ["url", "http", "https", "web", "category", "content filter", "cfs"]):
-        return None
-
-    url = None
-    domain = None
-    ip = None
-    user = None
-    action = None
-    category = None
-
-    m = URL_RE.search(raw)
+    m = _SYSLOG_TS.match(line)
     if m:
-        url = m.group("url")
+        out["syslog_ts_raw"] = m.group("ts")
+        out["host"] = m.group("host")
+        rest = m.group("rest")
+    else:
+        # Some SonicWall formats don't include the RFC-ish prefix
+        rest = line
 
-    m = DOMAIN_RE.search(raw)
-    if m:
-        domain = m.group("domain")
+    # Extract key/value pairs if present
+    kv: Dict[str, str] = {}
+    for km in _KV.finditer(rest):
+        k = km.group("k")
+        v = _strip_quotes(km.group("v"))
+        kv[k] = v
 
-    m = SRCIP_RE.search(raw)
-    if m:
-        ip = m.group("ip")
+    if kv:
+        out["fields"] = kv
+        out["message"] = rest
+    else:
+        # No kv structure detected: keep raw message
+        out["message"] = rest
 
-    m = USER_RE.search(raw)
-    if m:
-        user = m.group("user")
-
-    m = ACTION_RE.search(raw)
-    if m:
-        act = m.group("action").lower()
-        if act in {"deny", "denied", "drop", "dropped"}:
-            action = "blocked"
-        else:
+    return out
