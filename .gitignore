@@ -1,0 +1,15 @@
+.env
+secrets/
+*.db
+__pycache__/
+.venv/
+node_modules/
+dist/
+
+# Local backups / patches
+backend_backup_*.zip
+*.patch
+
+
+backend_backup_*.zip
+
