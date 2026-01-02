@@ -24,6 +24,9 @@ from .connectors.google_chrome import sync_chromebooks_for_customer
 
 
 app = FastAPI(title=settings.app_name)
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "k-12-asset-guardian"}
 
 # Create tables (MVP). For production use Alembic migrations.
 Base.metadata.create_all(bind=engine)
