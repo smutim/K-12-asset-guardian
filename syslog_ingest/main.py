@@ -72,3 +72,10 @@ def run_udp_server():
             },
             "user": {
                 "email":
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "k-12-asset-guardian"}
